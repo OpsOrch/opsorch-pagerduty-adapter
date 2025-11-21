@@ -1,12 +1,15 @@
 package incident
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	coreincident "github.com/opsorch/opsorch-core/incident"
@@ -30,19 +33,17 @@ type Config struct {
 	DefaultSeverity string
 	APIToken        string
 	APIURL          string
+	ServiceID       string // PagerDuty service ID for creating incidents
+	FromEmail       string // Email address of a valid PagerDuty user
 }
 
-// PagerDutyProvider is a minimal in-memory incident provider implementation for reference.
+// PagerDutyProvider integrates with PagerDuty REST API v2.
 type PagerDutyProvider struct {
-	cfg       Config
-	mu        sync.Mutex
-	nextID    int
-	incidents map[string]schema.Incident
-	timeline  map[string][]schema.TimelineEntry
+	cfg    Config
+	client *http.Client
 }
 
 // New constructs the provider from decrypted config.
-
 func New(cfg map[string]any) (coreincident.Provider, error) {
 	parsed := parseConfig(cfg)
 	if parsed.APIToken == "" {
@@ -51,11 +52,15 @@ func New(cfg map[string]any) (coreincident.Provider, error) {
 	if parsed.APIURL == "" {
 		return nil, errors.New("pagerduty apiURL is required")
 	}
+	if parsed.ServiceID == "" {
+		return nil, errors.New("pagerduty serviceID is required")
+	}
+	if parsed.FromEmail == "" {
+		return nil, errors.New("pagerduty fromEmail is required")
+	}
 	return &PagerDutyProvider{
-		cfg:       parsed,
-		nextID:    0,
-		incidents: make(map[string]schema.Incident),
-		timeline:  make(map[string][]schema.TimelineEntry),
+		cfg:    parsed,
+		client: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -63,147 +68,352 @@ func init() {
 	_ = coreincident.RegisterProvider(ProviderName, New)
 }
 
-// List returns all incidents currently held in memory.
+// List returns all incidents from PagerDuty.
 func (p *PagerDutyProvider) List(ctx context.Context) ([]schema.Incident, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	params := url.Values{}
+	params.Set("limit", "100")
+	params.Set("service_ids[]", p.cfg.ServiceID)
 
-	out := make([]schema.Incident, 0, len(p.incidents))
-	for _, inc := range p.incidents {
-		out = append(out, inc)
+	req, err := http.NewRequestWithContext(ctx, "GET", p.cfg.APIURL+"/incidents?"+params.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
 	}
-	return out, nil
+
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Incidents []pdIncident `json:"incidents"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	incidents := make([]schema.Incident, len(result.Incidents))
+	for i, pdInc := range result.Incidents {
+		incidents[i] = convertPDIncident(pdInc, p.cfg.Source)
+	}
+
+	return incidents, nil
 }
 
-// Get returns a single incident by ID.
+// Get returns a single incident by ID from PagerDuty.
 func (p *PagerDutyProvider) Get(ctx context.Context, id string) (schema.Incident, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	req, err := http.NewRequestWithContext(ctx, "GET", p.cfg.APIURL+"/incidents/"+id, nil)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("create request: %w", err)
+	}
 
-	inc, ok := p.incidents[id]
-	if !ok {
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
 		return schema.Incident{}, errNotFound
 	}
-	return inc, nil
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return schema.Incident{}, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Incident pdIncident `json:"incident"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return schema.Incident{}, fmt.Errorf("decode response: %w", err)
+	}
+
+	return convertPDIncident(result.Incident, p.cfg.Source), nil
 }
 
-// Create inserts an incident with generated ID and timestamps.
+// Create creates a new incident in PagerDuty.
 func (p *PagerDutyProvider) Create(ctx context.Context, in schema.CreateIncidentInput) (schema.Incident, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.nextID++
-	now := time.Now()
-	id := fmt.Sprintf("pd-%d", p.nextID)
-	incident := schema.Incident{
-		ID:        id,
-		Title:     in.Title,
-		Status:    in.Status,
-		Severity:  defaultString(in.Severity, p.cfg.DefaultSeverity),
-		Service:   in.Service,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Fields:    cloneMap(in.Fields),
-		Metadata:  cloneMap(in.Metadata),
+	payload := map[string]any{
+		"incident": map[string]any{
+			"type":  "incident",
+			"title": in.Title,
+			"service": map[string]string{
+				"id":   p.cfg.ServiceID,
+				"type": "service_reference",
+			},
+			"urgency": mapSeverityToUrgency(defaultString(in.Severity, p.cfg.DefaultSeverity)),
+		},
 	}
-	if incident.Metadata == nil {
-		incident.Metadata = map[string]any{}
-	}
-	incident.Metadata["source"] = p.cfg.Source
 
-	p.incidents[id] = incident
-	return incident, nil
+	// Add body if provided
+	if in.Fields != nil {
+		if body, ok := in.Fields["body"]; ok {
+			payload["incident"].(map[string]any)["body"] = map[string]any{
+				"type":    "incident_body",
+				"details": body,
+			}
+		}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("marshal create payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.cfg.APIURL+"/incidents", bytes.NewReader(body))
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+	req.Header.Set("From", p.cfg.FromEmail)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return schema.Incident{}, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Incident pdIncident `json:"incident"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return schema.Incident{}, fmt.Errorf("decode response: %w", err)
+	}
+
+	return convertPDIncident(result.Incident, p.cfg.Source), nil
 }
 
-// Update mutates incident fields and bumps UpdatedAt.
+// Update modifies an incident in PagerDuty.
 func (p *PagerDutyProvider) Update(ctx context.Context, id string, in schema.UpdateIncidentInput) (schema.Incident, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	inc, ok := p.incidents[id]
-	if !ok {
-		return schema.Incident{}, errNotFound
+	payload := map[string]any{
+		"incident": map[string]any{
+			"type": "incident",
+		},
 	}
 
 	if in.Title != nil {
-		inc.Title = *in.Title
+		payload["incident"].(map[string]any)["title"] = *in.Title
 	}
+
 	if in.Status != nil {
-		inc.Status = *in.Status
+		payload["incident"].(map[string]any)["status"] = mapStatusToPD(*in.Status)
 	}
+
 	if in.Severity != nil {
-		inc.Severity = *in.Severity
+		payload["incident"].(map[string]any)["urgency"] = mapSeverityToUrgency(*in.Severity)
 	}
-	if in.Service != nil {
-		inc.Service = *in.Service
-	}
-	if in.Fields != nil {
-		inc.Fields = cloneMap(in.Fields)
-	}
-	if in.Metadata != nil {
-		inc.Metadata = cloneMap(in.Metadata)
-	}
-	inc.UpdatedAt = time.Now()
 
-	p.incidents[id] = inc
-	return inc, nil
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("marshal update payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", p.cfg.APIURL+"/incidents/"+id, bytes.NewReader(body))
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+	req.Header.Set("From", p.cfg.FromEmail)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return schema.Incident{}, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return schema.Incident{}, errNotFound
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return schema.Incident{}, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Incident pdIncident `json:"incident"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return schema.Incident{}, fmt.Errorf("decode response: %w", err)
+	}
+
+	return convertPDIncident(result.Incident, p.cfg.Source), nil
 }
 
-// Query filters incidents matching the provided query.
+// Query searches for incidents in PagerDuty.
 func (p *PagerDutyProvider) Query(ctx context.Context, q schema.IncidentQuery) ([]schema.Incident, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	params := url.Values{}
+	params.Set("service_ids[]", p.cfg.ServiceID)
 
-	var out []schema.Incident
-	for _, inc := range p.incidents {
-		if !matchesQuery(inc, q) {
-			continue
+	if q.Limit > 0 {
+		params.Set("limit", fmt.Sprintf("%d", q.Limit))
+	} else {
+		params.Set("limit", "100")
+	}
+
+	if len(q.Statuses) > 0 {
+		for _, status := range q.Statuses {
+			params.Add("statuses[]", mapStatusToPD(status))
 		}
-		out = append(out, inc)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	if q.Limit > 0 && len(out) > q.Limit {
-		out = out[:q.Limit]
+	if len(q.Severities) > 0 {
+		for _, severity := range q.Severities {
+			params.Add("urgencies[]", mapSeverityToUrgency(severity))
+		}
 	}
-	return out, nil
+
+	req, err := http.NewRequestWithContext(ctx, "GET", p.cfg.APIURL+"/incidents?"+params.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Incidents []pdIncident `json:"incidents"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	incidents := make([]schema.Incident, 0, len(result.Incidents))
+	for _, pdInc := range result.Incidents {
+		inc := convertPDIncident(pdInc, p.cfg.Source)
+
+		// Apply client-side filters for fields PagerDuty API doesn't support
+		if q.Query != "" {
+			needle := strings.ToLower(q.Query)
+			haystack := strings.ToLower(inc.ID + " " + inc.Title)
+			if !strings.Contains(haystack, needle) {
+				continue
+			}
+		}
+
+		incidents = append(incidents, inc)
+	}
+
+	return incidents, nil
 }
 
-// GetTimeline returns the timeline entries for an incident.
+// GetTimeline returns the log entries (timeline) for an incident from PagerDuty.
 func (p *PagerDutyProvider) GetTimeline(ctx context.Context, id string) ([]schema.TimelineEntry, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	req, err := http.NewRequestWithContext(ctx, "GET", p.cfg.APIURL+"/incidents/"+id+"/log_entries", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
 
-	entries := p.timeline[id]
-	out := make([]schema.TimelineEntry, len(entries))
-	copy(out, entries)
-	return out, nil
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		LogEntries []pdLogEntry `json:"log_entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	entries := make([]schema.TimelineEntry, len(result.LogEntries))
+	for i, le := range result.LogEntries {
+		entries[i] = convertPDLogEntry(le, id)
+	}
+
+	return entries, nil
 }
 
-// AppendTimeline appends a timeline entry to an incident.
+// AppendTimeline adds a note to an incident in PagerDuty.
 func (p *PagerDutyProvider) AppendTimeline(ctx context.Context, id string, entry schema.TimelineAppendInput) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	payload := map[string]any{
+		"note": map[string]any{
+			"content": entry.Body,
+		},
+	}
 
-	if _, ok := p.incidents[id]; !ok {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal note payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.cfg.APIURL+"/incidents/"+id+"/notes", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
+	req.Header.Set("From", p.cfg.FromEmail)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
 		return errNotFound
 	}
 
-	n := len(p.timeline[id]) + 1
-	p.timeline[id] = append(p.timeline[id], schema.TimelineEntry{
-		ID:         fmt.Sprintf("%s-t%d", id, n),
-		IncidentID: id,
-		At:         entry.At,
-		Kind:       entry.Kind,
-		Body:       entry.Body,
-		Actor:      cloneMap(entry.Actor),
-		Metadata:   cloneMap(entry.Metadata),
-	})
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
+	}
+
 	return nil
 }
 
 func parseConfig(cfg map[string]any) Config {
-	out := Config{Source: "pagerduty", DefaultSeverity: "sev3", APIURL: "https://api.pagerduty.com"}
+	out := Config{
+		Source:          "pagerduty",
+		DefaultSeverity: "critical",
+		APIURL:          "https://api.pagerduty.com",
+	}
 	if v, ok := cfg["source"].(string); ok && v != "" {
 		out.Source = v
 	}
@@ -213,21 +423,88 @@ func parseConfig(cfg map[string]any) Config {
 	if v, ok := cfg["apiToken"].(string); ok {
 		out.APIToken = strings.TrimSpace(v)
 	}
-	if v, ok := cfg["apiURL"].(string); ok {
+	if v, ok := cfg["apiURL"].(string); ok && v != "" {
 		out.APIURL = strings.TrimSpace(v)
+	}
+	if v, ok := cfg["serviceID"].(string); ok {
+		out.ServiceID = strings.TrimSpace(v)
+	}
+	if v, ok := cfg["fromEmail"].(string); ok {
+		out.FromEmail = strings.TrimSpace(v)
 	}
 	return out
 }
 
-func cloneMap(in map[string]any) map[string]any {
-	if in == nil {
-		return nil
+// pdIncident represents a PagerDuty incident from the API.
+type pdIncident struct {
+	ID          string `json:"id"`
+	IncidentKey string `json:"incident_key"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+	Urgency     string `json:"urgency"`
+	Service     struct {
+		ID      string `json:"id"`
+		Summary string `json:"summary"`
+	} `json:"service"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// pdLogEntry represents a PagerDuty log entry.
+type pdLogEntry struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Summary   string `json:"summary"`
+	CreatedAt string `json:"created_at"`
+	Agent     *struct {
+		Summary string `json:"summary"`
+	} `json:"agent"`
+}
+
+func convertPDIncident(pdInc pdIncident, source string) schema.Incident {
+	inc := schema.Incident{
+		ID:       pdInc.ID,
+		Title:    pdInc.Title,
+		Status:   mapPDStatusToOpsOrch(pdInc.Status),
+		Severity: mapUrgencyToSeverity(pdInc.Urgency),
+		Service:  pdInc.Service.Summary,
+		Metadata: map[string]any{
+			"source":       source,
+			"incident_key": pdInc.IncidentKey,
+			"service_id":   pdInc.Service.ID,
+		},
 	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
+
+	if createdAt, err := time.Parse(time.RFC3339, pdInc.CreatedAt); err == nil {
+		inc.CreatedAt = createdAt
 	}
-	return out
+	if updatedAt, err := time.Parse(time.RFC3339, pdInc.UpdatedAt); err == nil {
+		inc.UpdatedAt = updatedAt
+	}
+
+	return inc
+}
+
+func convertPDLogEntry(le pdLogEntry, incidentID string) schema.TimelineEntry {
+	entry := schema.TimelineEntry{
+		ID:         le.ID,
+		IncidentID: incidentID,
+		Kind:       le.Type,
+		Body:       le.Summary,
+		Metadata:   map[string]any{},
+	}
+
+	if at, err := time.Parse(time.RFC3339, le.CreatedAt); err == nil {
+		entry.At = at
+	}
+
+	if le.Agent != nil {
+		entry.Actor = map[string]any{
+			"name": le.Agent.Summary,
+		}
+	}
+
+	return entry
 }
 
 func defaultString(val string, fallback string) string {
@@ -237,68 +514,58 @@ func defaultString(val string, fallback string) string {
 	return fallback
 }
 
-func matchesQuery(inc schema.Incident, q schema.IncidentQuery) bool {
-	if q.Query != "" {
-		needle := strings.ToLower(q.Query)
-		haystack := strings.ToLower(inc.ID + " " + inc.Title)
-		if !strings.Contains(haystack, needle) {
-			return false
-		}
+// mapSeverityToUrgency maps OpsOrch severity to PagerDuty urgency.
+func mapSeverityToUrgency(severity string) string {
+	switch strings.ToLower(severity) {
+	case "critical", "sev1", "p1":
+		return "high"
+	case "high", "sev2", "p2":
+		return "high"
+	case "medium", "sev3", "p3":
+		return "low"
+	case "low", "sev4", "p4":
+		return "low"
+	default:
+		return "high"
 	}
-
-	if len(q.Statuses) > 0 && !containsString(q.Statuses, inc.Status) {
-		return false
-	}
-	if len(q.Severities) > 0 && !containsString(q.Severities, inc.Severity) {
-		return false
-	}
-	if svc := strings.TrimSpace(q.Scope.Service); svc != "" && !strings.EqualFold(inc.Service, svc) {
-		return false
-	}
-	if env := strings.TrimSpace(q.Scope.Environment); env != "" {
-		if !metadataEqual(inc.Metadata, "environment", env, true) {
-			return false
-		}
-	}
-	if team := strings.TrimSpace(q.Scope.Team); team != "" {
-		if !metadataEqual(inc.Metadata, "team", team, true) {
-			return false
-		}
-	}
-	if len(q.Metadata) > 0 {
-		for k, v := range q.Metadata {
-			if !metadataEqual(inc.Metadata, k, v, false) {
-				return false
-			}
-		}
-	}
-
-	return true
 }
 
-func containsString(list []string, target string) bool {
-	for _, v := range list {
-		if v == target {
-			return true
-		}
+// mapUrgencyToSeverity maps PagerDuty urgency to OpsOrch severity.
+func mapUrgencyToSeverity(urgency string) string {
+	switch strings.ToLower(urgency) {
+	case "high":
+		return "critical"
+	case "low":
+		return "medium"
+	default:
+		return "medium"
 	}
-	return false
 }
 
-func metadataEqual(meta map[string]any, key string, expect any, foldString bool) bool {
-	if meta == nil {
-		return false
+// mapStatusToPD maps OpsOrch status to PagerDuty status.
+func mapStatusToPD(status string) string {
+	switch strings.ToLower(status) {
+	case "open", "triggered":
+		return "triggered"
+	case "acknowledged", "investigating":
+		return "acknowledged"
+	case "resolved", "closed":
+		return "resolved"
+	default:
+		return status
 	}
-	val, ok := meta[key]
-	if !ok {
-		return false
+}
+
+// mapPDStatusToOpsOrch maps PagerDuty status to OpsOrch status.
+func mapPDStatusToOpsOrch(status string) string {
+	switch strings.ToLower(status) {
+	case "triggered":
+		return "open"
+	case "acknowledged":
+		return "acknowledged"
+	case "resolved":
+		return "resolved"
+	default:
+		return status
 	}
-	if foldString {
-		expectStr, ok1 := expect.(string)
-		valStr, ok2 := val.(string)
-		if ok1 && ok2 {
-			return strings.EqualFold(valStr, expectStr)
-		}
-	}
-	return val == expect
 }

@@ -46,7 +46,15 @@ func TestEnsureProviderReturnsExisting(t *testing.T) {
 func TestEnsureProviderCachesNewInstance(t *testing.T) {
 	t.Cleanup(func() { provider = nil })
 
-	first, err := ensureProvider(map[string]any{"source": "demo", "apiToken": "token"})
+	cfg := map[string]any{
+		"source":    "demo",
+		"apiToken":  "token",
+		"apiURL":    "https://api.pagerduty.com",
+		"serviceID": "PXXXXXX",
+		"fromEmail": "user@example.com",
+	}
+
+	first, err := ensureProvider(cfg)
 	if err != nil {
 		t.Fatalf("ensureProvider returned error: %v", err)
 	}
