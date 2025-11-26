@@ -34,8 +34,12 @@ type rpcResponse struct {
 var provider coreincident.Provider
 
 func main() {
-	dec := json.NewDecoder(os.Stdin)
-	enc := json.NewEncoder(os.Stdout)
+	run(os.Stdin, os.Stdout)
+}
+
+func run(r io.Reader, w io.Writer) {
+	dec := json.NewDecoder(r)
+	enc := json.NewEncoder(w)
 
 	for {
 		var req rpcRequest
@@ -62,9 +66,6 @@ func main() {
 				continue
 			}
 			res, err := prov.Query(ctx, query)
-			write(enc, res, err)
-		case "incident.list":
-			res, err := prov.List(ctx)
 			write(enc, res, err)
 		case "incident.get":
 			var payload struct {

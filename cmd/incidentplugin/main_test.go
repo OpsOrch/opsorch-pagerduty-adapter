@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/opsorch/opsorch-core/schema"
@@ -12,7 +14,6 @@ type stubProvider struct{}
 func (stubProvider) Query(ctx context.Context, query schema.IncidentQuery) ([]schema.Incident, error) {
 	return nil, nil
 }
-func (stubProvider) List(ctx context.Context) ([]schema.Incident, error) { return nil, nil }
 func (stubProvider) Get(ctx context.Context, id string) (schema.Incident, error) {
 	return schema.Incident{}, nil
 }
@@ -68,5 +69,44 @@ func TestEnsureProviderCachesNewInstance(t *testing.T) {
 
 	if first == nil {
 		t.Fatalf("expected provider instance to be non-nil")
+	}
+}
+
+func TestRun(t *testing.T) {
+	// Setup mock provider
+	t.Cleanup(func() { provider = nil })
+	provider = stubProvider{}
+
+	// Prepare input
+	req := map[string]any{
+		"method":  "incident.query",
+		"config":  map[string]any{"source": "test"},
+		"payload": map[string]any{},
+	}
+	reqBytes, _ := json.Marshal(req)
+	input := bytes.NewBuffer(reqBytes)
+
+	// Capture output
+	var output bytes.Buffer
+
+	// Run plugin
+	run(input, &output)
+
+	// Verify output
+	var resp struct {
+		Result any    `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if resp.Error != "" {
+		t.Fatalf("Plugin returned error: %s", resp.Error)
+	}
+
+	// stubProvider returns nil for Query, so result should be null (or empty list depending on impl, here nil)
+	if resp.Result != nil {
+		t.Errorf("Expected nil result from stub, got %v", resp.Result)
 	}
 }

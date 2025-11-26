@@ -204,67 +204,6 @@ func TestGet(t *testing.T) {
 	})
 }
 
-func TestList(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/incidents") && r.Method == "GET" {
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]any{
-				"incidents": []map[string]any{
-					{
-						"id":           "PINCIDENT1",
-						"incident_key": "key1",
-						"title":        "Incident 1",
-						"status":       "triggered",
-						"urgency":      "high",
-						"service": map[string]any{
-							"id":      "PXXXXXX",
-							"summary": "Test Service",
-						},
-						"created_at": "2025-11-21T10:00:00Z",
-						"updated_at": "2025-11-21T10:00:00Z",
-					},
-					{
-						"id":           "PINCIDENT2",
-						"incident_key": "key2",
-						"title":        "Incident 2",
-						"status":       "acknowledged",
-						"urgency":      "low",
-						"service": map[string]any{
-							"id":      "PXXXXXX",
-							"summary": "Test Service",
-						},
-						"created_at": "2025-11-21T09:00:00Z",
-						"updated_at": "2025-11-21T10:30:00Z",
-					},
-				},
-			})
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	p := &PagerDutyProvider{
-		cfg: Config{
-			Source:    "pagerduty",
-			APIToken:  "test-token",
-			APIURL:    server.URL,
-			ServiceID: "PXXXXXX",
-			FromEmail: "user@example.com",
-		},
-		client: &http.Client{},
-	}
-	ctx := context.Background()
-
-	incidents, err := p.List(ctx)
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-	if len(incidents) != 2 {
-		t.Errorf("len(incidents) = %v, want 2", len(incidents))
-	}
-}
-
 func TestQuery(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/incidents") && r.Method == "GET" {
@@ -363,19 +302,256 @@ func TestQuery(t *testing.T) {
 			t.Errorf("len(incidents) = %v, want 1", len(incidents))
 		}
 	})
+}
 
-	t.Run("query with text search", func(t *testing.T) {
+func TestQueryFilters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/incidents") && r.Method == "GET" {
+			query := r.URL.Query()
+
+			// Check severities -> urgencies[]
+			if urgencies := query["urgencies[]"]; len(urgencies) > 0 && urgencies[0] == "high" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{"incidents": []map[string]any{}})
+				return
+			}
+
+			// Check Metadata["team_id"] -> team_ids[]
+			if teams := query["team_ids[]"]; len(teams) > 0 && teams[0] == "TEAM1" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{"incidents": []map[string]any{}})
+				return
+			}
+
+			// Check Metadata["service_id"] -> service_ids[]
+			if services := query["service_ids[]"]; len(services) > 0 && services[0] == "S1" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{"incidents": []map[string]any{}})
+				return
+			}
+
+			// Check Metadata["incident_key"] -> incident_key
+			if query.Get("incident_key") == "KEY1" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{"incidents": []map[string]any{}})
+				return
+			}
+
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	p := &PagerDutyProvider{
+		cfg:    Config{APIToken: "token", APIURL: server.URL},
+		client: &http.Client{},
+	}
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		query schema.IncidentQuery
+	}{
+		{
+			name:  "severities",
+			query: schema.IncidentQuery{Severities: []string{"critical"}},
+		},
+		{
+			name:  "metadata service_id",
+			query: schema.IncidentQuery{Metadata: map[string]any{"service_id": "S1"}},
+		},
+		{
+			name:  "metadata team_id",
+			query: schema.IncidentQuery{Metadata: map[string]any{"team_id": "TEAM1"}},
+		},
+		{
+			name:  "metadata incident_key",
+			query: schema.IncidentQuery{Metadata: map[string]any{"incident_key": "KEY1"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := p.Query(ctx, tt.query)
+			if err != nil {
+				t.Errorf("Query() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestQueryWithScope(t *testing.T) {
+	// Mock server that handles both /services, /teams, and /incidents
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/services":
+			// Return services for Scope.Service lookup
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"services": []map[string]any{
+					{"id": "SVC1", "name": "Production API"},
+					{"id": "SVC2", "name": "Production Database"},
+				},
+			})
+		case r.URL.Path == "/teams":
+			// Return teams for Scope.Team lookup
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"teams": []map[string]any{
+					{"id": "TEAM1", "name": "Platform Team"},
+				},
+			})
+		case strings.HasPrefix(r.URL.Path, "/incidents"):
+			query := r.URL.Query()
+			// Verify that service_ids or team_ids were translated and passed
+			serviceIDs := query["service_ids[]"]
+			teamIDs := query["team_ids[]"]
+
+			if len(serviceIDs) > 0 || len(teamIDs) > 0 {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{
+					"incidents": []map[string]any{
+						{
+							"id":      "INC1",
+							"title":   "Test Incident",
+							"status":  "triggered",
+							"urgency": "high",
+							"service": map[string]any{"id": "SVC1", "summary": "Production API"},
+						},
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	p := &PagerDutyProvider{
+		cfg:    Config{APIToken: "token", APIURL: server.URL},
+		client: &http.Client{},
+	}
+	ctx := context.Background()
+
+	t.Run("scope service", func(t *testing.T) {
 		incidents, err := p.Query(ctx, schema.IncidentQuery{
-			Query: "Incident 2",
+			Scope: schema.QueryScope{Service: "Production"},
 		})
 		if err != nil {
 			t.Fatalf("Query() error = %v", err)
 		}
 		if len(incidents) != 1 {
-			t.Errorf("len(incidents) = %v, want 1", len(incidents))
+			t.Errorf("expected 1 incident, got %d", len(incidents))
 		}
-		if incidents[0].Title != "Incident 2" {
-			t.Errorf("Title = %v, want Incident 2", incidents[0].Title)
+	})
+
+	t.Run("scope team", func(t *testing.T) {
+		incidents, err := p.Query(ctx, schema.IncidentQuery{
+			Scope: schema.QueryScope{Team: "Platform"},
+		})
+		if err != nil {
+			t.Fatalf("Query() error = %v", err)
+		}
+		if len(incidents) != 1 {
+			t.Errorf("expected 1 incident, got %d", len(incidents))
+		}
+	})
+}
+
+func TestQueryServiceIDFilter(t *testing.T) {
+	// Test that configured serviceID is NOT automatically used in queries
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/incidents") && r.Method == "GET" {
+			query := r.URL.Query()
+			serviceIDs := query["service_ids[]"]
+
+			// Return different incidents based on whether service filter is present
+			var incidents []map[string]any
+			if len(serviceIDs) > 0 {
+				// Filtered query
+				incidents = []map[string]any{
+					{
+						"id":         "INC1",
+						"title":      "Filtered Incident",
+						"status":     "triggered",
+						"urgency":    "high",
+						"service":    map[string]any{"id": serviceIDs[0], "summary": "Specific Service"},
+						"created_at": "2025-11-21T10:00:00Z",
+						"updated_at": "2025-11-21T10:00:00Z",
+					},
+				}
+			} else {
+				// Unfiltered query - returns incidents from all services
+				incidents = []map[string]any{
+					{
+						"id":         "INC1",
+						"title":      "Incident from Service A",
+						"status":     "triggered",
+						"urgency":    "high",
+						"service":    map[string]any{"id": "SVC_A", "summary": "Service A"},
+						"created_at": "2025-11-21T10:00:00Z",
+						"updated_at": "2025-11-21T10:00:00Z",
+					},
+					{
+						"id":         "INC2",
+						"title":      "Incident from Service B",
+						"status":     "acknowledged",
+						"urgency":    "low",
+						"service":    map[string]any{"id": "SVC_B", "summary": "Service B"},
+						"created_at": "2025-11-21T09:00:00Z",
+						"updated_at": "2025-11-21T10:30:00Z",
+					},
+				}
+			}
+
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{
+				"incidents": incidents,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	p := &PagerDutyProvider{
+		cfg: Config{
+			APIToken:  "token",
+			APIURL:    server.URL,
+			ServiceID: "DEFAULT_SVC",
+		},
+		client: &http.Client{},
+	}
+	ctx := context.Background()
+
+	t.Run("does not use configured serviceID when no filters", func(t *testing.T) {
+		incidents, err := p.Query(ctx, schema.IncidentQuery{})
+		if err != nil {
+			t.Fatalf("Query() error = %v", err)
+		}
+		// Should return incidents from all services
+		if len(incidents) != 2 {
+			t.Errorf("expected 2 incidents (from all services), got %d", len(incidents))
+		}
+	})
+
+	t.Run("uses explicit metadata service_id filter", func(t *testing.T) {
+		incidents, err := p.Query(ctx, schema.IncidentQuery{
+			Metadata: map[string]any{"service_id": "CUSTOM_SVC"},
+		})
+		if err != nil {
+			t.Fatalf("Query() error = %v", err)
+		}
+		// Should return only filtered incidents
+		if len(incidents) != 1 {
+			t.Errorf("expected 1 incident (filtered), got %d", len(incidents))
+		}
+		if incidents[0].Title != "Filtered Incident" {
+			t.Errorf("expected filtered incident, got %v", incidents[0].Title)
 		}
 	})
 }

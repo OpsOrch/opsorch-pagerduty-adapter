@@ -14,6 +14,7 @@ import (
 
 	coreincident "github.com/opsorch/opsorch-core/incident"
 	"github.com/opsorch/opsorch-core/schema"
+	"github.com/opsorch/opsorch-pagerduty-adapter/common"
 )
 
 // ProviderName is the registry key under which this adapter registers.
@@ -66,46 +67,6 @@ func New(cfg map[string]any) (coreincident.Provider, error) {
 
 func init() {
 	_ = coreincident.RegisterProvider(ProviderName, New)
-}
-
-// List returns all incidents from PagerDuty.
-func (p *PagerDutyProvider) List(ctx context.Context) ([]schema.Incident, error) {
-	params := url.Values{}
-	params.Set("limit", "100")
-	params.Set("service_ids[]", p.cfg.ServiceID)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", p.cfg.APIURL+"/incidents?"+params.Encode(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Token token="+p.cfg.APIToken)
-	req.Header.Set("Accept", "application/vnd.pagerduty+json;version=2")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("pagerduty api error: %d %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var result struct {
-		Incidents []pdIncident `json:"incidents"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	incidents := make([]schema.Incident, len(result.Incidents))
-	for i, pdInc := range result.Incidents {
-		incidents[i] = convertPDIncident(pdInc, p.cfg.Source)
-	}
-
-	return incidents, nil
 }
 
 // Get returns a single incident by ID from PagerDuty.
@@ -266,7 +227,6 @@ func (p *PagerDutyProvider) Update(ctx context.Context, id string, in schema.Upd
 // Query searches for incidents in PagerDuty.
 func (p *PagerDutyProvider) Query(ctx context.Context, q schema.IncidentQuery) ([]schema.Incident, error) {
 	params := url.Values{}
-	params.Set("service_ids[]", p.cfg.ServiceID)
 
 	if q.Limit > 0 {
 		params.Set("limit", fmt.Sprintf("%d", q.Limit))
@@ -283,6 +243,40 @@ func (p *PagerDutyProvider) Query(ctx context.Context, q schema.IncidentQuery) (
 	if len(q.Severities) > 0 {
 		for _, severity := range q.Severities {
 			params.Add("urgencies[]", mapSeverityToUrgency(severity))
+		}
+	}
+
+	// Translate Scope fields to PagerDuty IDs via lookups
+	if q.Scope.Service != "" {
+		serviceIDs, err := common.LookupServiceIDsByName(ctx, p.client, p.cfg.APIURL, p.cfg.APIToken, q.Scope.Service)
+		if err != nil {
+			return nil, fmt.Errorf("lookup service by name %q: %w", q.Scope.Service, err)
+		}
+		for _, id := range serviceIDs {
+			params.Add("service_ids[]", id)
+		}
+	}
+
+	if q.Scope.Team != "" {
+		teamIDs, err := common.LookupTeamIDsByName(ctx, p.client, p.cfg.APIURL, p.cfg.APIToken, q.Scope.Team)
+		if err != nil {
+			return nil, fmt.Errorf("lookup team by name %q: %w", q.Scope.Team, err)
+		}
+		for _, id := range teamIDs {
+			params.Add("team_ids[]", id)
+		}
+	}
+
+	// Map known metadata fields to API filters
+	if len(q.Metadata) > 0 {
+		if v, ok := q.Metadata["service_id"].(string); ok && v != "" {
+			params.Add("service_ids[]", v)
+		}
+		if v, ok := q.Metadata["team_id"].(string); ok && v != "" {
+			params.Add("team_ids[]", v)
+		}
+		if v, ok := q.Metadata["incident_key"].(string); ok && v != "" {
+			params.Set("incident_key", v)
 		}
 	}
 
@@ -312,20 +306,9 @@ func (p *PagerDutyProvider) Query(ctx context.Context, q schema.IncidentQuery) (
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	incidents := make([]schema.Incident, 0, len(result.Incidents))
-	for _, pdInc := range result.Incidents {
-		inc := convertPDIncident(pdInc, p.cfg.Source)
-
-		// Apply client-side filters for fields PagerDuty API doesn't support
-		if q.Query != "" {
-			needle := strings.ToLower(q.Query)
-			haystack := strings.ToLower(inc.ID + " " + inc.Title)
-			if !strings.Contains(haystack, needle) {
-				continue
-			}
-		}
-
-		incidents = append(incidents, inc)
+	incidents := make([]schema.Incident, len(result.Incidents))
+	for i, pdInc := range result.Incidents {
+		incidents[i] = convertPDIncident(pdInc, p.cfg.Source)
 	}
 
 	return incidents, nil
@@ -442,12 +425,22 @@ type pdIncident struct {
 	Title       string `json:"title"`
 	Status      string `json:"status"`
 	Urgency     string `json:"urgency"`
+	HTMLURL     string `json:"html_url"`
 	Service     struct {
 		ID      string `json:"id"`
 		Summary string `json:"summary"`
+		HTMLURL string `json:"html_url"`
 	} `json:"service"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	Assignments []struct {
+		Assignee struct {
+			ID      string `json:"id"`
+			Summary string `json:"summary"`
+			HTMLURL string `json:"html_url"`
+		} `json:"assignee"`
+	} `json:"assignments"`
+	LastStatusChangeAt string `json:"last_status_change_at"`
+	CreatedAt          string `json:"created_at"`
+	UpdatedAt          string `json:"updated_at"`
 }
 
 // pdLogEntry represents a PagerDuty log entry.
@@ -469,10 +462,25 @@ func convertPDIncident(pdInc pdIncident, source string) schema.Incident {
 		Severity: mapUrgencyToSeverity(pdInc.Urgency),
 		Service:  pdInc.Service.Summary,
 		Metadata: map[string]any{
-			"source":       source,
-			"incident_key": pdInc.IncidentKey,
-			"service_id":   pdInc.Service.ID,
+			"source":                source,
+			"incident_key":          pdInc.IncidentKey,
+			"service_id":            pdInc.Service.ID,
+			"service_url":           pdInc.Service.HTMLURL,
+			"html_url":              pdInc.HTMLURL,
+			"last_status_change_at": pdInc.LastStatusChangeAt,
 		},
+	}
+
+	if len(pdInc.Assignments) > 0 {
+		assignees := make([]map[string]string, len(pdInc.Assignments))
+		for i, assignment := range pdInc.Assignments {
+			assignees[i] = map[string]string{
+				"id":       assignment.Assignee.ID,
+				"name":     assignment.Assignee.Summary,
+				"html_url": assignment.Assignee.HTMLURL,
+			}
+		}
+		inc.Metadata["assignments"] = assignees
 	}
 
 	if createdAt, err := time.Parse(time.RFC3339, pdInc.CreatedAt); err == nil {
@@ -491,7 +499,9 @@ func convertPDLogEntry(le pdLogEntry, incidentID string) schema.TimelineEntry {
 		IncidentID: incidentID,
 		Kind:       le.Type,
 		Body:       le.Summary,
-		Metadata:   map[string]any{},
+		Metadata: map[string]any{
+			"type": le.Type,
+		},
 	}
 
 	if at, err := time.Parse(time.RFC3339, le.CreatedAt); err == nil {
