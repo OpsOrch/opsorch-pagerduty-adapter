@@ -96,6 +96,9 @@ func TestCreate(t *testing.T) {
 						"id":      "PXXXXXX",
 						"summary": "Test Service",
 					},
+					"body": map[string]any{
+						"details": "Test incident description",
+					},
 					"created_at": "2025-11-21T10:00:00Z",
 					"updated_at": "2025-11-21T10:00:00Z",
 				},
@@ -140,6 +143,9 @@ func TestCreate(t *testing.T) {
 	if inc.Severity != "critical" {
 		t.Errorf("Severity = %v, want critical", inc.Severity)
 	}
+	if inc.Description != "Test incident description" {
+		t.Errorf("Description = %v, want Test incident description", inc.Description)
+	}
 }
 
 func TestGet(t *testing.T) {
@@ -156,6 +162,9 @@ func TestGet(t *testing.T) {
 					"service": map[string]any{
 						"id":      "PXXXXXX",
 						"summary": "Test Service",
+					},
+					"body": map[string]any{
+						"details": "Acknowledged incident details",
 					},
 					"created_at": "2025-11-21T10:00:00Z",
 					"updated_at": "2025-11-21T11:00:00Z",
@@ -194,12 +203,64 @@ func TestGet(t *testing.T) {
 		if inc.Status != "acknowledged" {
 			t.Errorf("Status = %v, want acknowledged", inc.Status)
 		}
+		if inc.Description != "Acknowledged incident details" {
+			t.Errorf("Description = %v, want Acknowledged incident details", inc.Description)
+		}
 	})
 
 	t.Run("get non-existent incident", func(t *testing.T) {
 		_, err := p.Get(ctx, "NOTFOUND")
 		if err != errNotFound {
 			t.Errorf("Get() error = %v, want errNotFound", err)
+		}
+	})
+
+	t.Run("get incident without body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/incidents/PNOBODY" && r.Method == "GET" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{
+					"incident": map[string]any{
+						"id":           "PNOBODY",
+						"incident_key": "nobodykey",
+						"title":        "Incident without body",
+						"status":       "triggered",
+						"urgency":      "high",
+						"service": map[string]any{
+							"id":      "PXXXXXX",
+							"summary": "Test Service",
+						},
+						// No body field
+						"created_at": "2025-11-21T10:00:00Z",
+						"updated_at": "2025-11-21T10:00:00Z",
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer server.Close()
+
+		prov := &PagerDutyProvider{
+			cfg: Config{
+				Source:    "pagerduty",
+				APIToken:  "test-token",
+				APIURL:    server.URL,
+				ServiceID: "PXXXXXX",
+				FromEmail: "user@example.com",
+			},
+			client: &http.Client{},
+		}
+
+		inc, err := prov.Get(context.Background(), "PNOBODY")
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if inc.Description != "" {
+			t.Errorf("Description = %v, want empty string", inc.Description)
+		}
+		if inc.ID != "PNOBODY" {
+			t.Errorf("ID = %v, want PNOBODY", inc.ID)
 		}
 	})
 }

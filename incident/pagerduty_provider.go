@@ -118,13 +118,11 @@ func (p *PagerDutyProvider) Create(ctx context.Context, in schema.CreateIncident
 		},
 	}
 
-	// Add body if provided
-	if in.Fields != nil {
-		if body, ok := in.Fields["body"]; ok {
-			payload["incident"].(map[string]any)["body"] = map[string]any{
-				"type":    "incident_body",
-				"details": body,
-			}
+	// Add description if provided
+	if in.Description != "" {
+		payload["incident"].(map[string]any)["body"] = map[string]any{
+			"type":    "incident_body",
+			"details": in.Description,
 		}
 	}
 
@@ -438,6 +436,9 @@ type pdIncident struct {
 			HTMLURL string `json:"html_url"`
 		} `json:"assignee"`
 	} `json:"assignments"`
+	Body struct {
+		Details string `json:"details"`
+	} `json:"body"`
 	LastStatusChangeAt string `json:"last_status_change_at"`
 	CreatedAt          string `json:"created_at"`
 	UpdatedAt          string `json:"updated_at"`
@@ -456,11 +457,12 @@ type pdLogEntry struct {
 
 func convertPDIncident(pdInc pdIncident, source string) schema.Incident {
 	inc := schema.Incident{
-		ID:       pdInc.ID,
-		Title:    pdInc.Title,
-		Status:   mapPDStatusToOpsOrch(pdInc.Status),
-		Severity: mapUrgencyToSeverity(pdInc.Urgency),
-		Service:  pdInc.Service.Summary,
+		ID:          pdInc.ID,
+		Title:       pdInc.Title,
+		Description: pdInc.Body.Details,
+		Status:      mapPDStatusToOpsOrch(pdInc.Status),
+		Severity:    mapUrgencyToSeverity(pdInc.Urgency),
+		Service:     pdInc.Service.Summary,
 		Metadata: map[string]any{
 			"source":                source,
 			"incident_key":          pdInc.IncidentKey,
